@@ -51,7 +51,8 @@ if main_category == "設計計算":
             "波形グラフ生成（台形波・三角波）",
             "モータの必要トルク計算",
             "設計用 単位換算ツール",
-            "巻回構造の径・断面グラフ計算"
+            "巻回構造の径・断面グラフ計算",
+            "カム機構の計算・描画"
         ],
         horizontal=True
     )
@@ -721,6 +722,340 @@ if main_category == "設計計算":
             
             st.pyplot(fig)
 
+    # ==========================================
+    # 1-8. カム機構の計算・描画ツール（セグメント別評価＆最大圧力角対応）
+    # ==========================================
+    elif app_mode == "カム機構の計算・描画":
+        st.title("カム機構の運動解析・形状描画ツール（動的マルチセグメント）")
+        st.markdown("1回転（360度）を任意の数のセグメントに分割し、ストロークの増減から上昇・下降・休止を自動判定して連続解析を行います。")
+
+        st.subheader("■ 基礎条件の設定")
+        col_base1, col_base2 = st.columns(2)
+        with col_base1:
+            tact_time = st.number_input("1回転のタクトタイム (Total Time, s)", value=1.0, min_value=0.01)
+            lever_ratio = st.number_input("レバー比 (-)", value=1.0, min_value=0.01)
+        with col_base2:
+            base_radius = st.number_input("カム代表R (ベース円半径 R0, mm)", value=30.0, min_value=1.0)
+            follower_radius = st.number_input("カムフォロア径 (R, mm)", value=5.0, min_value=0.1)
+
+        st.markdown("---")
+        st.subheader("■ セグメント構成の定義（自由追加・編集）")
+
+        if "cam_seg_count" not in st.session_state:
+            st.session_state.cam_seg_count = 3
+
+        col_add, col_del = st.columns(2)
+        if col_add.button("＋ セグメントを追加"):
+            st.session_state.cam_seg_count += 1
+            st.rerun()
+        if col_del.button("－ セグメントを削除") and st.session_state.cam_seg_count > 1:
+            st.session_state.cam_seg_count -= 1
+            st.rerun()
+
+        segments_config = []
+        total_input_angle = 0.0
+
+        for i in range(st.session_state.cam_seg_count):
+            st.markdown(f"**【セグメント {i+1}】**")
+            c_cols = st.columns(3)
+            with c_cols[0]:
+                seg_angle = st.number_input(f"割付角 (度)", value=90.0, min_value=1.0, max_value=360.0, key=f"seg_ang_{i}")
+            with c_cols[1]:
+                seg_target_s = st.number_input(f"終点ストローク (mm)", value=20.0 if i % 2 == 0 else 0.0, key=f"seg_str_{i}")
+            with c_cols[2]:
+                seg_curve = st.selectbox(f"カム曲線", ["MS 変形正弦", "MT 変形台形", "MCV 変形等速度"], key=f"seg_cur_{i}")
+            
+            segments_config.append({
+                "angle": seg_angle,
+                "target_stroke": seg_target_s * lever_ratio,
+                "curve": seg_curve
+            })
+            total_input_angle += seg_angle
+
+        st.info(f"現在の割付角合計: **{total_input_angle:.1f} 度**")
+
+        st.markdown("---")
+        calc_triggered = st.button("360度全体の計算・グラフを描画する")
+
+        if calc_triggered or "cam_data" in st.session_state:
+            if calc_triggered:
+                if total_input_angle != 360.0 and len(segments_config) > 0:
+                    diff = 360.0 - total_input_angle
+                    segments_config[-1]["angle"] += diff
+                    if segments_config[-1]["angle"] < 1.0:
+                        segments_config[-1]["angle"] = 1.0
+
+                def generate_dynamic_segment(n_pts, beta_deg, c_type, start_s, end_s):
+                    if n_pts <= 0 or beta_deg <= 0:
+                        return np.array([]), np.array([]), np.array([]), np.array([])
+                    
+                    r_arr = np.linspace(0, 1, n_pts)
+                    beta_rad = math.radians(beta_deg)
+                    t_seg = tact_time * (beta_deg / 360.0)
+                    if t_seg <= 0: t_seg = 1e-6
+                    omega_seg = beta_rad / t_seg
+
+                    is_rising = (end_s >= start_s)
+                    stroke_diff = abs(end_s - start_s)
+
+                    a_norm = np.zeros_like(r_arr)
+                    if c_type == "MS 変形正弦":
+                        for idx, r in enumerate(r_arr):
+                            if r <= 0.25: a_norm[idx] = math.sin(4.0 * math.pi * r)
+                            elif r <= 0.75: a_norm[idx] = 0.0
+                            else: a_norm[idx] = -math.sin(4.0 * math.pi * (r - 0.75))
+                    elif c_type == "MT 変形台形":
+                        for idx, r in enumerate(r_arr):
+                            if r <= 0.125: a_norm[idx] = 1.0 - math.cos(4.0 * math.pi * r)
+                            elif r <= 0.375: a_norm[idx] = 2.0
+                            elif r <= 0.625: a_norm[idx] = 2.0 - 4.0 * (r - 0.375) / 0.25
+                            elif r <= 0.875: a_norm[idx] = -2.0
+                            else: 
+                                rem = 1.0 - r
+                                a_norm[idx] = -(1.0 - math.cos(4.0 * math.pi * rem))
+                    else:  # MCV
+                        for idx, r in enumerate(r_arr):
+                            if r <= 0.2: a_norm[idx] = math.sin(2.5 * math.pi * r)
+                            elif r <= 0.8: a_norm[idx] = 0.0
+                            else: 
+                                rem = 1.0 - r
+                                a_norm[idx] = -math.sin(2.5 * math.pi * rem)
+
+                    dr = 1.0 / (n_pts - 1) if n_pts > 1 else 1.0
+                    v_n = np.cumsum(a_norm) * dr
+                    s_n = np.cumsum(v_n) * dr
+                    s_max = s_n[-1] if s_n[-1] > 0 else 1e-6
+
+                    if stroke_diff == 0.0:
+                        seg_s = np.full_like(r_arr, start_s)
+                        seg_v = np.zeros_like(r_arr)
+                        seg_a = np.zeros_like(r_arr)
+                        seg_j = np.zeros_like(r_arr)
+                    else:
+                        if is_rising:
+                            seg_s = start_s + (s_n / s_max) * stroke_diff
+                        else:
+                            seg_s = start_s - (s_n / s_max) * stroke_diff
+                        
+                        ds_dr = np.gradient(seg_s, r_arr)
+                        seg_v = ds_dr * (1.0 / t_seg)
+                        dv_dr = np.gradient(seg_v, r_arr)
+                        seg_a = dv_dr * (1.0 / t_seg) * omega_seg
+                        da_dr = np.gradient(seg_a, r_arr)
+                        seg_j = da_dr * (1.0 / t_seg) * omega_seg
+
+                    return seg_s, seg_v, seg_a, seg_j
+
+                all_th, all_s, all_v, all_a, all_j = [], [], [], [], []
+                segment_meta = []
+                current_stroke = 0.0
+                current_angle = 0.0
+
+                for s_idx, seg in enumerate(segments_config):
+                    ang = seg["angle"]
+                    target_s = seg["target_stroke"]
+                    curve = seg["curve"]
+                    n_pts = max(int(150 * (ang / 180.0)), 20)
+                    
+                    th_seg = np.linspace(current_angle, current_angle + ang, n_pts, endpoint=False)
+                    s_seg, v_seg, a_seg, j_seg = generate_dynamic_segment(n_pts, ang, curve, current_stroke, target_s)
+
+                    all_th.append(th_seg)
+                    all_s.append(s_seg)
+                    all_v.append(v_seg)
+                    all_a.append(a_seg)
+                    all_j.append(j_seg)
+
+                    segment_meta.append({
+                        "id": s_idx + 1,
+                        "start_angle": current_angle,
+                        "end_angle": current_angle + ang,
+                        "start_stroke": current_stroke,
+                        "end_stroke": target_s,
+                        "curve": curve,
+                        "theta_deg": th_seg,
+                        "stroke": s_seg,
+                        "velocity": v_seg,
+                        "acceleration": a_seg
+                    })
+
+                    current_stroke = target_s
+                    current_angle += ang
+
+                theta_deg_arr = np.concatenate(all_th + [np.array([360.0])])
+                s_arr = np.concatenate(all_s + [np.array([all_s[0][0]])])
+                v_arr = np.concatenate(all_v + [np.array([0.0])])
+                a_arr = np.concatenate(all_a + [np.array([0.0])])
+                j_arr = np.concatenate(all_j + [np.array([0.0])])
+                time_arr = (theta_deg_arr / 360.0) * tact_time
+
+                pressure_angle_arr = np.zeros_like(theta_deg_arr)
+                for idx, th_d in enumerate(theta_deg_arr):
+                    ds_dth = np.gradient(s_arr, np.radians(theta_deg_arr))[idx]
+                    tan_alpha = ds_dth / (base_radius + s_arr[idx]) if (base_radius + s_arr[idx]) > 0 else 0
+                    pressure_angle_arr[idx] = math.degrees(math.atan(tan_alpha))
+
+                # 各セグメントメタデータに個別評価値（最大速度、加速度、G、圧力角）を付与
+                for meta in segment_meta:
+                    mask = (theta_deg_arr >= meta["start_angle"]) & (theta_deg_arr <= meta["end_angle"])
+                    sub_v = np.abs(v_arr[mask])
+                    sub_a = np.abs(a_arr[mask])
+                    sub_pa = np.abs(pressure_angle_arr[mask])
+                    
+                    meta["max_v"] = np.max(sub_v) if len(sub_v) > 0 else 0.0
+                    meta["max_a"] = np.max(sub_a) if len(sub_a) > 0 else 0.0
+                    meta["max_g"] = (meta["max_a"] / 1000.0) / 9.80665
+                    meta["max_pa"] = np.max(sub_pa) if len(sub_pa) > 0 else 0.0
+
+                st.session_state.cam_data = {
+                    "theta_deg": theta_deg_arr,
+                    "time": time_arr,
+                    "stroke": s_arr,
+                    "velocity": v_arr,
+                    "acceleration": a_arr,
+                    "pressure_angle": pressure_angle_arr,
+                    "segment_meta": segment_meta
+                }
+
+            # ------------------------------------------------
+            # 評価の表示部（セグメント別 ＆ 1回転全体）
+            # ------------------------------------------------
+            c_data = st.session_state.cam_data
+            
+            # 1. セグメント別の評価表示
+            st.markdown("### 📋 セグメント別 運動特性評価")
+            for meta in c_data["segment_meta"]:
+                with st.expander(f"セグメント {meta['id']} ({meta['start_angle']:.1f}° ～ {meta['end_angle']:.1f}° | {meta['curve']})"):
+                    sc1, sc2, sc3, sc4, sc5 = st.columns(5)
+                    sc1.metric("区間ストローク", f"{meta['start_stroke']:.1f} → {meta['end_stroke']:.1f} mm")
+                    sc2.metric("最大速度", f"{meta['max_v']:,.2f} mm/s")
+                    sc3.metric("最大加速度", f"{meta['max_a']:,.1f} mm/s²")
+                    sc4.metric("最大 G", f"{meta['max_g']:,.2f} G")
+                    sc5.metric("最大圧力角", f"{meta['max_pa']:.2f} deg")
+
+            st.markdown("---")
+
+            # 2. 1回転全体の評価表示
+            max_v = np.max(np.abs(c_data["velocity"]))
+            max_a = np.max(np.abs(c_data["acceleration"]))
+            max_g = (max_a / 1000.0) / 9.80665
+            max_pa = np.max(np.abs(c_data["pressure_angle"]))
+            max_stroke = np.max(c_data["stroke"])
+
+            st.markdown("### 📈 1回転全体の運動特性評価")
+            p1, p2, p3, p4, p5 = st.columns(5)
+            p1.metric("最大速度", f"{max_v:,.2f} mm/s")
+            p2.metric("最大加速度", f"{max_a:,.1f} mm/s²")
+            p3.metric("最大 G 換算", f"{max_g:,.2f} G")
+            p4.metric("最大圧力角", f"{max_pa:.2f} deg")
+            p5.metric("最大ストローク", f"{max_stroke:.1f} mm")
+
+            # グラフ描画
+            st.markdown("### 📊 360度 変位線図・運動特性グラフ")
+            fig, axes = plt.subplots(4, 1, figsize=(8, 12))
+            
+            axes[0].plot(c_data["theta_deg"], c_data["stroke"], color='#2563eb', linewidth=2.2)
+            axes[0].set_title("Stroke vs Angle", fontsize=10, fontweight='bold')
+            axes[0].set_ylabel("Stroke (mm)")
+            axes[0].set_xlim(0, 360)
+            axes[0].grid(True, linestyle='--', alpha=0.6)
+
+            axes[1].plot(c_data["theta_deg"], c_data["velocity"], color='#16a34a', linewidth=2.2)
+            axes[1].set_title("Velocity vs Angle", fontsize=10, fontweight='bold')
+            axes[1].set_ylabel("Velocity (mm/s)")
+            axes[1].set_xlim(0, 360)
+            axes[1].grid(True, linestyle='--', alpha=0.6)
+
+            axes[2].plot(c_data["theta_deg"], c_data["acceleration"], color='#d97706', linewidth=2.2)
+            axes[2].set_title("Acceleration vs Angle", fontsize=10, fontweight='bold')
+            axes[2].set_ylabel("Accel (mm/s²)")
+            axes[2].set_xlim(0, 360)
+            axes[2].grid(True, linestyle='--', alpha=0.6)
+
+            axes[3].plot(c_data["theta_deg"], np.gradient(c_data["acceleration"], np.radians(c_data["theta_deg"])), color='#dc2626', linewidth=2.2)
+            axes[3].set_title("Jerk vs Angle", fontsize=10, fontweight='bold')
+            axes[3].set_xlabel("Angle (deg)")
+            axes[3].set_ylabel("Jerk (mm/s³)")
+            axes[3].set_xlim(0, 360)
+            axes[3].grid(True, linestyle='--', alpha=0.6)
+
+            plt.tight_layout()
+            st.pyplot(fig)
+
+            # カムプロファイル
+            theta_full_rad = np.radians(c_data["theta_deg"])
+            r_cam_full = base_radius + c_data["stroke"]
+            x_cam = r_cam_full * np.sin(theta_full_rad)
+            y_cam = r_cam_full * np.cos(theta_full_rad)
+
+            fig2, ax_cam = plt.subplots(figsize=(6, 6))
+            ax_cam.clear()
+            ax_cam.plot(x_cam, y_cam, color='#dc2626', linewidth=2.5, label='Cam Profile (360deg)')
+            base_circle = plt.Circle((0, 0), base_radius, color='#94a3b8', fill=False, linestyle='--', label='Base Radius')
+            ax_cam.add_patch(base_circle)
+            ax_cam.set_aspect('equal')
+            ax_cam.set_title("Cam Profile (Full 360 Revolution)", fontsize=11, fontweight='bold')
+            ax_cam.set_xlabel("X (mm)")
+            ax_cam.set_ylabel("Y (mm)")
+            ax_cam.legend(loc='upper right')
+            ax_cam.grid(True, linestyle='--', alpha=0.6)
+            st.pyplot(fig2)
+
+            # セグメント別 逆算アシスト
+            st.markdown("---")
+            st.subheader("■ セグメント別 逆算アシスト（運動状態の確認）")
+            
+            meta_list = c_data.get("segment_meta", [])
+            if meta_list:
+                seg_options = [f"セグメント {m['id']} ({m['start_angle']:.1f}° ～ {m['end_angle']:.1f}° | stroke: {m['start_stroke']:.1f} → {m['end_stroke']:.1f}mm)" for m in meta_list]
+                selected_seg_label = st.selectbox("対象セグメントを選択", seg_options)
+                selected_seg_idx = seg_options.index(selected_seg_label)
+                target_meta = meta_list[selected_seg_idx]
+
+                calc_direction = st.radio("逆算モードを選択", ["ストロークから角度・時間を求める", "角度からストローク・速度・加速度を求める"], horizontal=True)
+
+                mask = (c_data["theta_deg"] >= target_meta["start_angle"]) & (c_data["theta_deg"] <= target_meta["end_angle"])
+                seg_th = c_data["theta_deg"][mask]
+                seg_t = c_data["time"][mask]
+                seg_s = c_data["stroke"][mask]
+                seg_v = c_data["velocity"][mask]
+                seg_a = c_data["acceleration"][mask]
+
+                min_s_seg, max_s_seg = float(np.min(seg_s)), float(np.max(seg_s))
+                if min_s_seg > max_s_seg: min_s_seg, max_s_seg = max_s_seg, min_s_seg
+
+                if calc_direction == "ストロークから角度・時間を求める":
+                    target_s_val = st.number_input(f"調べたいストローク (mm) [範囲: {min_s_seg:.1f} ～ {max_s_seg:.1f}]", value=float((min_s_seg + max_s_seg) / 2.0), min_value=min_s_seg, max_value=max_s_seg)
+                    if len(seg_s) > 0:
+                        idx_sub = np.argmin(np.abs(seg_s - target_s_val))
+                        res_deg = seg_th[idx_sub]
+                        res_time = seg_t[idx_sub]
+                        res_v = seg_v[idx_sub]
+                        res_a = seg_a[idx_sub]
+                        
+                        c_res1, c_res2, c_res3, c_res4 = st.columns(4)
+                        c_res1.metric("対応する角度", f"{res_deg:.2f} deg")
+                        c_res2.metric("対応する時間", f"{res_time:.3f} s")
+                        c_res3.metric("瞬間速度", f"{res_v:.2f} mm/s")
+                        c_res4.metric("瞬間加速度", f"{res_a:.1f} mm/s²")
+                else:
+                    min_t_seg, max_t_seg = float(np.min(seg_t)), float(np.max(seg_t))
+                    target_t_val = st.number_input(f"調べたい時間 (s) [範囲: {min_t_seg:.3f} ～ {max_t_seg:.3f}]", value=float((min_t_seg + max_t_seg) / 2.0), min_value=min_t_seg, max_value=max_t_seg)
+                    if len(seg_t) > 0:
+                        idx_sub = np.argmin(np.abs(seg_t - target_t_val))
+                        res_deg = seg_th[idx_sub]
+                        res_s = seg_s[idx_sub]
+                        res_v = seg_v[idx_sub]
+                        res_a = seg_a[idx_sub]
+
+                        c_res1, c_res2, c_res3, c_res4 = st.columns(4)
+                        c_res1.metric("対応する角度", f"{res_deg:.2f} deg")
+                        c_res2.metric("対応するストローク", f"{res_s:.3f} mm")
+                        c_res3.metric("瞬間速度", f"{res_v:.2f} mm/s")
+                        c_res4.metric("瞬間加速度", f"{res_a:.1f} mm/s²")
+        else:
+            st.info("上の「360度全体の計算・グラフを描画する」ボタンを押すと、グラフおよび逆算機能が有効になります。")
+
 
 # ==========================================
 # 2. 関数・グラフ生成 カテゴリ
@@ -729,16 +1064,12 @@ elif main_category == "関数・グラフ生成":
     st.title("関数・グラフ生成ツール")
     st.markdown("スマホで簡単に数式を入力できるよう、主要な文字・記号の入力ボタンを設置しています。")
 
-    # 1. 最初に確実にセッションステートを初期化する
     if "func_expr" not in st.session_state:
         st.session_state.func_expr = "x**2 - 4"
 
-    # 2. st.text_input には key="func_expr" のみを指定し、左辺への代入はしない
     st.text_input("関数を入力してください (変数: x)", key="func_expr")
 
-    # スマホ用入力補助キーパッド
     with st.expander("📱 スマホ用 入力補助キーパッドを開く", expanded=False):
-        st.caption("ボタンをタップすると入力欄に文字が追加されます。")
         col_b1, col_b2, col_b3, col_b4, col_b5, col_b6 = st.columns(6)
         if col_b1.button("x", key="fn_x"): st.session_state.func_expr += "x"; st.rerun()
         if col_b2.button("+", key="fn_add"): st.session_state.func_expr += "+"; st.rerun()
@@ -803,86 +1134,40 @@ elif main_category == "電卓":
         st.subheader("ボタン式関数電卓")
         st.markdown("画面上のボタンをタップして数式を組み立て、計算を実行できます。")
 
-        # 入力式を保持するセッションステートの初期化
         if "calc_expr" not in st.session_state:
             st.session_state.calc_expr = ""
 
-        # 現在の入力式を表示するディスプレイ部分
         current_display = st.session_state.calc_expr if st.session_state.calc_expr else "0"
         st.info(f"**入力式:** {current_display}")
 
-        # --- 電卓キーパッドの配置 ---
-        # 1行目: クリア、カッコ、割り算
         c1, c2, c3, c4 = st.columns(4)
-        if c1.button("C", key="calc_c"): 
-            st.session_state.calc_expr = ""
-            st.rerun()
-        if c2.button("(", key="calc_lp"): 
-            st.session_state.calc_expr += "("
-            st.rerun()
-        if c3.button(")", key="calc_rp"): 
-            st.session_state.calc_expr += ")"
-            st.rerun()
-        if c4.button("÷", key="calc_div"): 
-            st.session_state.calc_expr += "/"
-            st.rerun()
+        if c1.button("C", key="calc_c"): st.session_state.calc_expr = ""; st.rerun()
+        if c2.button("(", key="calc_lp"): st.session_state.calc_expr += "("; st.rerun()
+        if c3.button(")", key="calc_rp"): st.session_state.calc_expr += ")"; st.rerun()
+        if c4.button("÷", key="calc_div"): st.session_state.calc_expr += "/"; st.rerun()
 
-        # 2行目: 7, 8, 9, ×
         c1, c2, c3, c4 = st.columns(4)
-        if c1.button("7", key="calc_7"): 
-            st.session_state.calc_expr += "7"
-            st.rerun()
-        if c2.button("8", key="calc_8"): 
-            st.session_state.calc_expr += "8"
-            st.rerun()
-        if c3.button("9", key="calc_9"): 
-            st.session_state.calc_expr += "9"
-            st.rerun()
-        if c4.button("×", key="calc_mul"): 
-            st.session_state.calc_expr += "*"
-            st.rerun()
+        if c1.button("7", key="calc_7"): st.session_state.calc_expr += "7"; st.rerun()
+        if c2.button("8", key="calc_8"): st.session_state.calc_expr += "8"; st.rerun()
+        if c3.button("9", key="calc_9"): st.session_state.calc_expr += "9"; st.rerun()
+        if c4.button("×", key="calc_mul"): st.session_state.calc_expr += "*"; st.rerun()
 
-        # 3行目: 4, 5, 6, -
         c1, c2, c3, c4 = st.columns(4)
-        if c1.button("4", key="calc_4"): 
-            st.session_state.calc_expr += "4"
-            st.rerun()
-        if c2.button("5", key="calc_5"): 
-            st.session_state.calc_expr += "5"
-            st.rerun()
-        if c3.button("6", key="calc_6"): 
-            st.session_state.calc_expr += "6"
-            st.rerun()
-        if c4.button("-", key="calc_sub"): 
-            st.session_state.calc_expr += "-"
-            st.rerun()
+        if c1.button("4", key="calc_4"): st.session_state.calc_expr += "4"; st.rerun()
+        if c2.button("5", key="calc_5"): st.session_state.calc_expr += "5"; st.rerun()
+        if c3.button("6", key="calc_6"): st.session_state.calc_expr += "6"; st.rerun()
+        if c4.button("-", key="calc_sub"): st.session_state.calc_expr += "-"; st.rerun()
 
-        # 4行目: 1, 2, 3, +
         c1, c2, c3, c4 = st.columns(4)
-        if c1.button("1", key="calc_1"): 
-            st.session_state.calc_expr += "1"
-            st.rerun()
-        if c2.button("2", key="calc_2"): 
-            st.session_state.calc_expr += "2"
-            st.rerun()
-        if c3.button("3", key="calc_3"): 
-            st.session_state.calc_expr += "3"
-            st.rerun()
-        if c4.button("+", key="calc_add"): 
-            st.session_state.calc_expr += "+"
-            st.rerun()
+        if c1.button("1", key="calc_1"): st.session_state.calc_expr += "1"; st.rerun()
+        if c2.button("2", key="calc_2"): st.session_state.calc_expr += "2"; st.rerun()
+        if c3.button("3", key="calc_3"): st.session_state.calc_expr += "3"; st.rerun()
+        if c4.button("+", key="calc_add"): st.session_state.calc_expr += "+"; st.rerun()
 
-        # 5行目: 0, ., 1文字削除(⌫), ＝
         c1, c2, c3, c4 = st.columns(4)
-        if c1.button("0", key="calc_0"): 
-            st.session_state.calc_expr += "0"
-            st.rerun()
-        if c2.button(".", key="calc_dot"): 
-            st.session_state.calc_expr += "."
-            st.rerun()
-        if c3.button("⌫", key="calc_bs"): 
-            st.session_state.calc_expr = st.session_state.calc_expr[:-1]
-            st.rerun()
+        if c1.button("0", key="calc_0"): st.session_state.calc_expr += "0"; st.rerun()
+        if c2.button(".", key="calc_dot"): st.session_state.calc_expr += "."; st.rerun()
+        if c3.button("⌫", key="calc_bs"): st.session_state.calc_expr = st.session_state.calc_expr[:-1]; st.rerun()
         if c4.button("＝", key="calc_eq"):
             try:
                 calc_scope = {
@@ -895,27 +1180,13 @@ elif main_category == "電卓":
             except Exception as e:
                 st.error(f"計算エラー: {e}")
 
-        # 6行目: 特殊関数ボタン
-        st.markdown("##### 📐 関数・定数パッド")
         f1, f2, f3, f4, f5, f6 = st.columns(6)
-        if f1.button("sin", key="calc_sin"): 
-            st.session_state.calc_expr += "sin("
-            st.rerun()
-        if f2.button("cos", key="calc_cos"): 
-            st.session_state.calc_expr += "cos("
-            st.rerun()
-        if f3.button("tan", key="calc_tan"): 
-            st.session_state.calc_expr += "tan("
-            st.rerun()
-        if f4.button("sqrt", key="calc_sqrt"): 
-            st.session_state.calc_expr += "sqrt("
-            st.rerun()
-        if f5.button("pi", key="calc_pi"): 
-            st.session_state.calc_expr += "pi"
-            st.rerun()
-        if f6.button("log", key="calc_log"): 
-            st.session_state.calc_expr += "log("
-            st.rerun()
+        if f1.button("sin", key="calc_sin"): st.session_state.calc_expr += "sin("; st.rerun()
+        if f2.button("cos", key="calc_cos"): st.session_state.calc_expr += "cos("; st.rerun()
+        if f3.button("tan", key="calc_tan"): st.session_state.calc_expr += "tan("; st.rerun()
+        if f4.button("sqrt", key="calc_sqrt"): st.session_state.calc_expr += "sqrt("; st.rerun()
+        if f5.button("pi", key="calc_pi"): st.session_state.calc_expr += "pi"; st.rerun()
+        if f6.button("log", key="calc_log"): st.session_state.calc_expr += "log("; st.rerun()
 
     with calc_tab2:
         st.subheader("設計用 単位換算")
@@ -964,13 +1235,10 @@ elif main_category == "電卓":
         st.subheader("複数数値の集計・統計分析")
         st.markdown("複数の数値をスペース、カンマ（`,`）、または改行区切りで入力してください。統計量の計算とデータ分布のグラフ化を行います。")
 
-        # 入力エリア
         data_input = st.text_area("測定データ・数値入力", value="10.2, 10.5, 9.8, 10.1, 10.3, 10.0, 9.9, 10.4, 10.1, 10.2")
 
         if st.button("集計・グラフ化を実行"):
             try:
-                # 入力文字列を数値のリストに変換（カンマやスペース、改行に対応）
-                # 全角カンマやスペースも考慮して置換
                 cleaned_input = data_input.replace("，", ",").replace("\n", ",")
                 raw_list = [x.strip() for x in cleaned_input.split(",") if x.strip()]
                 data_array = np.array([float(x) for x in raw_list])
@@ -978,11 +1246,10 @@ elif main_category == "電卓":
                 if len(data_array) == 0:
                     st.warning("有効な数値が入力されていません。")
                 else:
-                    # 統計量の計算
                     count = len(data_array)
                     total_sum = np.sum(data_array)
                     mean_val = np.mean(data_array)
-                    std_val = np.std(data_array, ddof=1) if count > 1 else 0.0 # 不偏標準偏差
+                    std_val = np.std(data_array, ddof=1) if count > 1 else 0.0
                     var_val = np.var(data_array, ddof=1) if count > 1 else 0.0
                     min_val = np.min(data_array)
                     max_val = np.max(data_array)
@@ -990,7 +1257,6 @@ elif main_category == "電卓":
 
                     st.success("集計が完了しました！")
 
-                    # メトリックで主要な統計量を表示
                     m1, m2, m3, m4 = st.columns(4)
                     m1.metric("データ数 (n)", f"{count}")
                     m2.metric("合計値 (Sum)", f"{total_sum:,.3f}")
@@ -1006,10 +1272,7 @@ elif main_category == "電卓":
                     st.markdown("---")
                     st.markdown("### 📊 データ分布グラフ（ヒストグラム ＆ 推移）")
 
-                    # グラフの描画（2つのサブプロット：ヒストグラムと折れ線推移）
                     fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(10, 4))
-
-                    # 1. ヒストグラム（データのばらつき・分布）
                     ax1.hist(data_array, bins='auto', color='#2563eb', edgecolor='white', alpha=0.8)
                     ax1.axvline(mean_val, color='red', linestyle='--', linewidth=1.5, label=f'Mean: {mean_val:.2f}')
                     ax1.set_title("Data Distribution (Histogram)", fontsize=11, fontweight='bold')
@@ -1018,7 +1281,6 @@ elif main_category == "電卓":
                     ax1.legend()
                     ax1.grid(True, linestyle='--', alpha=0.5)
 
-                    # 2. シーケンスプロット（データの順番通りの推移）
                     ax2.plot(range(1, count + 1), data_array, marker='o', color='#16a34a', linewidth=2)
                     ax2.axhline(mean_val, color='red', linestyle='--', linewidth=1.5, label=f'Mean')
                     ax2.set_title("Sequence Plot", fontsize=11, fontweight='bold')
